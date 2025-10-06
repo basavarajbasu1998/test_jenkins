@@ -1,0 +1,144 @@
+pipeline {
+    agent { label 'tenjin-pt-test' }
+
+    // Automatically trigger on code commits
+    triggers {
+        // Poll SCM every 2 minutes for changes
+        pollSCM('H/2 * * * *')
+        
+        // Other polling options:
+        // pollSCM('H/5 * * * *')    // Every 5 minutes
+        // pollSCM('H * * * *')       // Every hour
+        // pollSCM('H/15 * * * *')    // Every 15 minutes
+        // pollSCM('H H * * *')       // Once per day
+    }
+
+    parameters {
+        string(name: 'TEST_ID', defaultValue: '6504', description: 'Test ID')
+        string(name: 'PROJECT_ID', defaultValue: '224', description: 'Project ID')
+        string(name: 'SERVER_HOST', defaultValue: '192.168.16.176', description: 'Server Host/IP')
+        string(name: 'SERVER_PORT', defaultValue: '81', description: 'Server Port')
+    }
+
+    environment {
+        CLUSTER_ID = "152"
+        CREATED_BY = "admin"
+        CREATED_BY_EMAIL = "admin@gmail.com"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                script {
+                    // Checkout and capture commit information
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],
+                        userRemoteConfigs: [[url: 'https://github.com/basavarajbasu1998/test_jenkins.git']]
+                    ])
+                    
+                    // Get commit details
+                    env.GIT_COMMIT_MSG = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+                    env.GIT_COMMIT_AUTHOR = sh(script: 'git log -1 --pretty=%an', returnStdout: true).trim()
+                    env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    
+                    echo "Deploying commit: ${env.GIT_COMMIT_HASH}"
+                    echo "Author: ${env.GIT_COMMIT_AUTHOR}"
+                    echo "Message: ${env.GIT_COMMIT_MSG}"
+                }
+            }
+        }
+
+        stage('Initializing Execution') {
+            steps {
+                script {
+                    def baseUrl = "http://${params.SERVER_HOST}:${params.SERVER_PORT}"
+
+                    def response = sh(
+                        script: """curl -s -X POST "${baseUrl}/api/execution" \
+                                   -H "accept: */*" \
+                                   -H "Content-Type: application/json" \
+                                   -d '{
+                                         "testId": ${params.TEST_ID},
+                                         "clusterId": "${env.CLUSTER_ID}",
+                                         "projectId": "${params.PROJECT_ID}",
+                                         "createdBy": "${env.CREATED_BY}",
+                                         "createdByEmail": "${env.CREATED_BY_EMAIL}"
+                                       }'""",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "API 1 Response: ${response}"
+                    def json = readJSON text: response
+                    env.EXECUTION_ID = json.executionId
+                    echo "Execution ID: ${env.EXECUTION_ID}"
+                }
+            }
+        }
+
+        stage('Running Execution') {
+            steps {
+                script {
+                    def baseUrl = "http://${params.SERVER_HOST}:${params.SERVER_PORT}"
+                    def executionStatus = "Running"
+
+                    timeout(time: 30, unit: 'MINUTES') {
+                        while (executionStatus == "Running") {
+                            sleep 10
+
+                            def statusResponse = sh(
+                                script: """curl -s -X GET "${baseUrl}/api/execution/summary?executionId=${env.EXECUTION_ID}" \
+                                           -H "accept: */*" \
+                                           -H "Content-Type: application/json" """,
+                                returnStdout: true
+                            ).trim()
+
+                            echo "API 2 Response: ${statusResponse}"
+                            def statusJson = readJSON text: statusResponse
+                            executionStatus = statusJson?.execution?.executionStatus ?: statusJson?.executionStatus ?: "Running"
+                            echo "Current Execution Status: ${executionStatus}"
+                        }
+                    }
+
+                    echo "Execution Finished with Status: ${executionStatus}"
+                }
+            }
+        }
+
+        stage('Preparing Execution Results') {
+            steps {
+                script {
+                    def baseUrl = "http://${params.SERVER_HOST}:${params.SERVER_PORT}"
+                    def zipFile = "execution_${env.EXECUTION_ID}_build_${env.BUILD_NUMBER}_${env.GIT_COMMIT_HASH}.zip"
+
+                    sh """curl -s -o ${zipFile} "${baseUrl}/api/zip/${env.EXECUTION_ID}" """
+                    echo "ZIP file downloaded: ${zipFile} (workspace: ${pwd()})"
+
+                    archiveArtifacts artifacts: zipFile, fingerprint: true
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "✅ Pipeline completed successfully!"
+            echo "Build: ${env.BUILD_NUMBER}"
+            echo "Commit: ${env.GIT_COMMIT_HASH}"
+            echo "Author: ${env.GIT_COMMIT_AUTHOR}"
+        }
+        failure {
+            echo "❌ Pipeline failed for build ${env.BUILD_NUMBER}"
+            echo "Commit: ${env.GIT_COMMIT_HASH}"
+        }
+        always {
+            // Clean up workspace if needed
+            cleanWs(cleanWhenNotBuilt: false,
+                    deleteDirs: true,
+                    disableDeferredWipeout: true,
+                    notFailBuild: true)
+        }
+    }
+}
